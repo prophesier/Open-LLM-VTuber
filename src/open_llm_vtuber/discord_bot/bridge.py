@@ -122,6 +122,7 @@ class OLVBridge:
         request_id: str,
         on_reply: ReplyCallback,
         images: Optional[Sequence[dict[str, Any]]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Send a single user turn and await its full reply.
 
@@ -143,6 +144,8 @@ class OLVBridge:
                 payload: dict[str, Any] = {"type": "text-input", "text": text}
                 if images:
                     payload["images"] = list(images)
+                if metadata:
+                    payload["metadata"] = dict(metadata)
                 async with self._send_lock:
                     await self._ws.send(json.dumps(payload))
                 logger.debug(
@@ -272,6 +275,17 @@ class OLVBridge:
             if self._current_turn is not None:
                 self._current_turn.result.error = message
                 self._current_turn.done.set()
+            # The proxy only resets conversation_active on chain-end or
+            # interrupt-signal. OLV doesn't send chain-end on errors, so send
+            # interrupt-signal to unblock the proxy's message queue.
+            if self._ws is not None:
+                try:
+                    async with self._send_lock:
+                        await self._ws.send(
+                            json.dumps({"type": "interrupt-signal", "text": ""})
+                        )
+                except Exception:
+                    pass
             return
 
         # Other message types (set-model-and-conf, group-update, history-list, ...)
