@@ -70,6 +70,12 @@ class WebSocketHandler:
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
 
+        # Global session registry: one active session per conf_uid shared across
+        # all connected clients (web + proxy).  Prevents a second client from
+        # auto-creating a duplicate session when another is already running.
+        self._active_history_uid: Dict[str, str] = {}   # conf_uid → history_uid
+        self._session_ref_count: Dict[str, int] = {}    # conf_uid → # clients using it
+
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
 
@@ -198,6 +204,7 @@ class WebSocketHandler:
             tool_adapter=self.default_context_cache.tool_adapter,
             send_text=send_text,
             client_uid=client_uid,
+            memory_manager=self.default_context_cache.memory_manager,
         )
         return session_service_context
 
@@ -279,6 +286,9 @@ class WebSocketHandler:
 
     async def handle_disconnect(self, client_uid: str) -> None:
         """Handle client disconnection"""
+        # Snapshot context before any cleanup removes it from the dict.
+        context = self.client_contexts.get(client_uid)
+
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
             await handle_group_interrupt(
@@ -297,6 +307,20 @@ class WebSocketHandler:
             send_group_update=self.send_group_update,
         )
 
+        # Decrement global session ref count for this client.
+        if context:
+            conf_uid = context.character_config.conf_uid
+            history_uid = context.history_uid
+            if history_uid and self._active_history_uid.get(conf_uid) == history_uid:
+                remaining = self._session_ref_count.get(conf_uid, 1) - 1
+                if remaining <= 0:
+                    self._active_history_uid.pop(conf_uid, None)
+                    self._session_ref_count.pop(conf_uid, None)
+                    if context.memory_manager:
+                        context.memory_manager.set_current_session("")
+                else:
+                    self._session_ref_count[conf_uid] = remaining
+
         # Clean up other client data
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
@@ -307,8 +331,7 @@ class WebSocketHandler:
                 task.cancel()
             self.current_conversation_tasks.pop(client_uid, None)
 
-        # Call context close to clean up resources (e.g., MCPClient)
-        context = self.client_contexts.get(client_uid)
+        # Close context resources (e.g., MCPClient).
         if context:
             await context.close()
 
@@ -432,15 +455,96 @@ class WebSocketHandler:
     async def _handle_create_history(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
-        """Handle creation of new chat history"""
+        """Handle creation or reuse of chat history.
+
+        Uses a global session registry (per conf_uid) so that all connected
+        clients — e.g. a Discord proxy and a web UI — share a single session.
+        The second client to connect adopts the first's session instead of
+        creating a new one.  Pass {"force": true} to explicitly start a new
+        session (which ends the current shared session).
+        """
         context = self.client_contexts[client_uid]
-        history_uid = create_new_history(context.character_config.conf_uid)
+        conf_uid = context.character_config.conf_uid
+        force = bool(data.get("force", False)) if isinstance(data, dict) else False
+
+        # --- Adopt the globally active session if one already exists ---
+        global_uid = self._active_history_uid.get(conf_uid)
+        if global_uid and not force:
+            if context.history_uid != global_uid:
+                # This client is joining an existing session for the first time.
+                context.history_uid = global_uid
+                self._session_ref_count[conf_uid] = (
+                    self._session_ref_count.get(conf_uid, 0) + 1
+                )
+                if context.memory_manager:
+                    context.memory_manager.set_current_session(global_uid)
+                mem_cfg = context.system_config.persistent_memory
+                if mem_cfg.enabled and hasattr(
+                    context.agent_engine, "set_memory_from_recent_histories"
+                ):
+                    context.agent_engine.set_memory_from_recent_histories(
+                        conf_uid=conf_uid,
+                        n=mem_cfg.recent_sessions,
+                        current_uid=global_uid,
+                    )
+                else:
+                    context.agent_engine.set_memory_from_history(
+                        conf_uid=conf_uid,
+                        history_uid=global_uid,
+                    )
+            logger.info(
+                f"Client {client_uid} adopted globally active session {global_uid}"
+            )
+            await websocket.send_text(
+                json.dumps({"type": "new-history-created", "history_uid": global_uid})
+            )
+            return
+
+        # --- End the previous session (diary + facts) if this context held one ---
+        if context.memory_manager and context.history_uid:
+            old_uid = context.history_uid
+            # Only finalize when no other client is still on that session.
+            old_ref_count = self._session_ref_count.get(conf_uid, 1) - 1
+            if old_ref_count <= 0:
+                from .chat_history_manager import get_history as _get_history
+                old_messages = _get_history(conf_uid, old_uid)
+                llm = getattr(context.agent_engine, "_llm", None)
+                if old_messages and llm:
+                    asyncio.create_task(
+                        context.memory_manager.end_of_session_async(
+                            old_messages, old_uid, llm
+                        )
+                    )
+                self._active_history_uid.pop(conf_uid, None)
+                self._session_ref_count.pop(conf_uid, None)
+                if context.memory_manager:
+                    context.memory_manager.set_current_session("")
+            else:
+                self._session_ref_count[conf_uid] = old_ref_count
+
+        # --- Create new session and register it globally ---
+        history_uid = create_new_history(conf_uid)
         if history_uid:
             context.history_uid = history_uid
-            context.agent_engine.set_memory_from_history(
-                conf_uid=context.character_config.conf_uid,
-                history_uid=history_uid,
-            )
+            self._active_history_uid[conf_uid] = history_uid
+            self._session_ref_count[conf_uid] = 1
+            if context.memory_manager:
+                context.memory_manager.set_current_session(history_uid)
+
+            mem_cfg = context.system_config.persistent_memory
+            if mem_cfg.enabled and hasattr(
+                context.agent_engine, "set_memory_from_recent_histories"
+            ):
+                context.agent_engine.set_memory_from_recent_histories(
+                    conf_uid=conf_uid,
+                    n=mem_cfg.recent_sessions,
+                    current_uid=history_uid,
+                )
+            else:
+                context.agent_engine.set_memory_from_history(
+                    conf_uid=conf_uid,
+                    history_uid=history_uid,
+                )
             await websocket.send_text(
                 json.dumps(
                     {

@@ -8,13 +8,14 @@ from typing import (
     Union,
     Optional,
 )
+from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
-from ...chat_history_manager import get_history
+from ...chat_history_manager import get_history, get_recent_histories
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -67,6 +68,7 @@ class BasicMemoryAgent(AgentInterface):
         self._tool_executor = tool_executor
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
+        self._memory_manager = None  # set via set_memory_manager()
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -173,24 +175,203 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
 
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
-        """Load memory from chat history."""
-        messages = get_history(conf_uid, history_uid)
+    def set_memory_manager(self, manager) -> None:
+        """Attach a PersistentMemoryManager for fact extraction and diary injection."""
+        self._memory_manager = manager
 
-        self._memory = []
-        for msg in messages:
-            role = "user" if msg["role"] == "human" else "assistant"
-            content = msg["content"]
-            if isinstance(content, str) and content:
-                self._memory.append(
+    @staticmethod
+    def _format_timestamp(ts: str) -> str:
+        """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        try:
+            dt = datetime.fromisoformat(ts)
+            return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}]"
+        except (ValueError, TypeError):
+            return f"[{ts}]" if ts else ""
+
+    @classmethod
+    def _now_tag(cls) -> str:
+        """Timestamp tag for messages happening right now."""
+        return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
+
+    _TIMESTAMP_NOTE = (
+        "Note on timestamps: user messages are prefixed with "
+        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know when each message "
+        "was sent. These tags are metadata for your reference only — do NOT "
+        "include any such timestamp tag in your own replies."
+    )
+
+    def _build_runtime_system(self) -> str:
+        """Return the full system prompt as a plain string (used for non-Claude LLMs)."""
+        parts = [self._system]
+        if self._memory_manager:
+            mem_block = self._memory_manager.get_memory_prompt()
+            if mem_block:
+                parts.append(mem_block)
+        parts.append(self._TIMESTAMP_NOTE)
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Prompt caching helpers (Claude only)
+    # ------------------------------------------------------------------
+
+    _CACHE_CONTROL_1H = {"type": "ephemeral", "ttl": "1h"}
+
+    def _is_claude_llm(self) -> bool:
+        return isinstance(self._llm, ClaudeAsyncLLM)
+
+    def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
+        """Return system prompt in the right shape for the active LLM.
+
+        For Claude, returns up to 3 separately cache-controlled blocks:
+          1. Persona + timestamp note  (ultra-stable, changes only on character edit)
+          2. Facts                     (changes only on fact extraction)
+          3. Diaries                   (changes only when a new diary is generated)
+        Combined with the message-history breakpoint (_attach_cache_breakpoint),
+        this uses up to 4 of Anthropic's allowed cache checkpoints.
+
+        For other LLMs, returns the plain combined string.
+        """
+        if not self._is_claude_llm():
+            return self._build_runtime_system()
+
+        blocks: List[Dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": "\n\n".join([self._system, self._TIMESTAMP_NOTE]),
+                "cache_control": self._CACHE_CONTROL_1H,
+            }
+        ]
+        if self._memory_manager:
+            facts_text = self._memory_manager.get_facts_prompt()
+            if facts_text:
+                blocks.append(
                     {
-                        "role": role,
-                        "content": content,
+                        "type": "text",
+                        "text": facts_text,
+                        "cache_control": self._CACHE_CONTROL_1H,
                     }
                 )
+            diaries_text = self._memory_manager.get_diaries_prompt()
+            if diaries_text:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": diaries_text,
+                        "cache_control": self._CACHE_CONTROL_1H,
+                    }
+                )
+        return blocks
+
+    def _attach_cache_breakpoint(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Mark the last message's last text block with cache_control.
+
+        Returns a new list with the last message replaced; the original
+        message objects (which live in self._memory) are not mutated.
+        Only applies for Claude LLM — otherwise returns messages unchanged.
+        """
+        if not self._is_claude_llm() or not messages:
+            return messages
+
+        new_messages = list(messages)
+        last = new_messages[-1]
+        content = last.get("content")
+
+        if isinstance(content, str):
+            new_last = {
+                **last,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": self._CACHE_CONTROL_1H,
+                    }
+                ],
+            }
+        elif isinstance(content, list) and content:
+            new_content = [dict(c) for c in content]
+            new_content[-1] = {
+                **new_content[-1],
+                "cache_control": self._CACHE_CONTROL_1H,
+            }
+            new_last = {**last, "content": new_content}
+        else:
+            return new_messages
+
+        new_messages[-1] = new_last
+        return new_messages
+
+    def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Convert a stored history record into a memory entry.
+
+        Timestamps are prepended only to user messages so the LLM knows when
+        each turn occurred.  Omitting them from assistant turns prevents the
+        model from mimicking the format in its own replies.
+        """
+        role = "user" if msg["role"] == "human" else "assistant"
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            return None
+        if role == "user":
+            tag = self._format_timestamp(msg.get("timestamp", ""))
+            content = f"{tag} {content}".strip()
+        return {"role": role, "content": content}
+
+    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+        """Load memory from a single chat history file."""
+        messages = get_history(conf_uid, history_uid)
+        self._memory = []
+        for msg in messages:
+            entry = self._msg_from_history_record(msg)
+            if entry:
+                self._memory.append(entry)
             else:
                 logger.warning(f"Skipping invalid message from history: {msg}")
         logger.info(f"Loaded {len(self._memory)} messages from history.")
+
+    def set_memory_from_recent_histories(
+        self, conf_uid: str, n: int, current_uid: str = ""
+    ) -> None:
+        """Load the N most recent COMPLETED session histories into memory, then
+        append any messages already in the current (in-progress) session.
+
+        Keeping the current session separate from the N-session window ensures
+        that the sliding window membership is identical regardless of when
+        different clients connect during a shared session, which prevents
+        spurious cache misses on Anthropic's prompt cache.
+        """
+        sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
+        self._memory = []
+        loaded_uids = []
+        for uid, messages in sessions:
+            loaded_uids.append(uid)
+            for msg in messages:
+                entry = self._msg_from_history_record(msg)
+                if entry:
+                    self._memory.append(entry)
+
+        # Always append the current session last so conversation continuity
+        # is preserved even for clients that join mid-session.
+        if current_uid:
+            current_messages = get_history(conf_uid, current_uid)
+            if current_messages:
+                for msg in current_messages:
+                    entry = self._msg_from_history_record(msg)
+                    if entry:
+                        self._memory.append(entry)
+            loaded_uids.append(current_uid)
+
+        if self._memory_manager:
+            # Diaries for all loaded sessions are suppressed — their content
+            # is already present verbatim in self._memory.
+            self._memory_manager.set_active_sessions(loaded_uids)
+        logger.info(
+            f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)"
+            + (" + current session" if current_uid else "")
+            + "."
+        )
 
     def handle_interrupt(self, heard_response: str) -> None:
         """Handle user interruption."""
@@ -223,8 +404,14 @@ class BasicMemoryAgent(AgentInterface):
         logger.info(f"Handled interrupt with role '{interrupt_role}'.")
 
     def _to_text_prompt(self, input_data: BatchInput) -> str:
-        """Format input data to text prompt."""
-        message_parts = []
+        """Format input data to text prompt.
+
+        Prepends a timestamp so the LLM has temporal context for this turn —
+        especially important when older messages (loaded from history) also
+        carry their own timestamps; without this tag the LLM would assume
+        the new message has no time at all.
+        """
+        message_parts = [self._now_tag()]
 
         for text_data in input_data.texts:
             if text_data.source == TextSource.INPUT:
@@ -242,6 +429,10 @@ class BasicMemoryAgent(AgentInterface):
     def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
         messages = self._memory.copy()
+        # Cache breakpoint goes on the last historical message — everything
+        # up to and including it gets cached by Anthropic, while the fresh
+        # user input appended below stays uncached. No-op for non-Claude.
+        messages = self._attach_cache_breakpoint(messages)
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
         if text_prompt:
@@ -299,7 +490,7 @@ class BasicMemoryAgent(AgentInterface):
         current_assistant_message_content = []
 
         while True:
-            stream = self._llm.chat_completion(messages, self._system, tools=tools)
+            stream = self._llm.chat_completion(messages, self._build_system_for_llm(), tools=tools)
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -409,20 +600,19 @@ class BasicMemoryAgent(AgentInterface):
         messages = initial_messages.copy()
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
-        current_system_prompt = self._system
 
         while True:
             if self.prompt_mode_flag:
                 if self._mcp_prompt_string:
                     current_system_prompt = (
-                        f"{self._system}\n\n{self._mcp_prompt_string}"
+                        f"{self._build_runtime_system()}\n\n{self._mcp_prompt_string}"
                     )
                 else:
                     logger.warning("Prompt mode active but mcp_prompt_string is empty!")
-                    current_system_prompt = self._system
+                    current_system_prompt = self._build_runtime_system()
                 tools_for_api = None
             else:
-                current_system_prompt = self._system
+                current_system_prompt = self._build_runtime_system()
                 tools_for_api = tools
 
             stream = self._llm.chat_completion(
@@ -643,7 +833,9 @@ class BasicMemoryAgent(AgentInterface):
                 return
             else:
                 logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(messages, self._system)
+                token_stream = self._llm.chat_completion(
+                    messages, self._build_system_for_llm()
+                )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""

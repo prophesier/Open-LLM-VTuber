@@ -260,6 +260,8 @@ def get_history_list(conf_uid: str) -> List[dict]:
         for filename in os.listdir(conf_dir):
             if not filename.endswith(".json"):
                 continue
+            if filename == "facts.json":
+                continue
 
             history_uid = filename[:-5]
             filepath = os.path.join(conf_dir, filename)
@@ -349,6 +351,31 @@ def modify_latest_message(
     except Exception as e:
         logger.error(f"Failed to modify latest message: {e}")
         return False
+
+
+def get_recent_histories(
+    conf_uid: str, n: int, exclude_uid: str = ""
+) -> List[tuple[str, List[HistoryMessage]]]:
+    """Return the N most recent non-empty histories, ordered oldest→newest.
+
+    Each element is (history_uid, messages).
+    exclude_uid is skipped so callers can keep the active session separate
+    and append it themselves, ensuring the sliding window membership is
+    stable across reconnects (preventing spurious cache invalidations).
+    """
+    history_list = get_history_list(conf_uid)  # already newest-first
+    result = []
+    for entry in history_list:
+        if len(result) >= n:
+            break
+        uid = entry["uid"]
+        if uid == exclude_uid:
+            continue
+        messages = get_history(conf_uid, uid)
+        if messages:
+            result.append((uid, messages))
+    result.reverse()  # oldest first so memory builds chronologically
+    return result
 
 
 def rename_history_file(

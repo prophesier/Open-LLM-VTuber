@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from typing import Callable
 from loguru import logger
 from fastapi import WebSocket
@@ -36,6 +37,7 @@ from .config_manager import (
     read_yaml,
     validate_config,
 )
+from .memory.persistent_memory import PersistentMemoryManager
 
 
 class ServiceContext:
@@ -57,6 +59,7 @@ class ServiceContext:
 
         self.mcp_server_registery: ServerRegistry | None = None
         self.tool_adapter: ToolAdapter | None = None
+        self.memory_manager: PersistentMemoryManager | None = None
         self.tool_manager: ToolManager | None = None
         self.mcp_client: MCPClient | None = None
         self.tool_executor: ToolExecutor | None = None
@@ -213,6 +216,7 @@ class ServiceContext:
         tool_adapter: ToolAdapter | None = None,
         send_text: Callable = None,
         client_uid: str = None,
+        memory_manager: PersistentMemoryManager | None = None,
     ) -> None:
         """
         Load the ServiceContext with the reference of the provided instances.
@@ -237,12 +241,28 @@ class ServiceContext:
         self.tool_adapter = tool_adapter
         self.send_text = send_text
         self.client_uid = client_uid
+        # Memory manager is initialised on the default cache by init_agent;
+        # per-connection contexts share the same instance so end-of-session
+        # triggers fired from _handle_create_history see it.
+        self.memory_manager = memory_manager
 
         # Initialize session-specific MCP components
         await self._init_mcp_components(
             self.character_config.agent_config.agent_settings.basic_memory_agent.use_mcpp,
             self.character_config.agent_config.agent_settings.basic_memory_agent.mcp_enabled_servers,
         )
+
+        # Kick off persistent-memory backfill on the live event loop. The
+        # class-level in-progress guard makes this safe to call on every
+        # connection — only the first one will actually do work.
+        if self.memory_manager:
+            llm = getattr(self.agent_engine, "_llm", None)
+            if llm:
+                asyncio.create_task(
+                    self.memory_manager.backfill_async(
+                        self.character_config.conf_uid, llm
+                    )
+                )
 
         logger.debug(f"Loaded service context with cache: {character_config}")
 
@@ -399,6 +419,26 @@ class ServiceContext:
             # Save the current configuration
             self.character_config.agent_config = agent_config
             self.system_prompt = system_prompt
+
+            # Wire up persistent memory if enabled. Backfill is *not* scheduled
+            # here because init_agent runs inside asyncio.run() during server
+            # startup — any task created on that throwaway event loop would be
+            # discarded before uvicorn's loop takes over. Backfill is kicked
+            # off from load_cache() instead, which runs on the live loop when
+            # a client connects.
+            mem_cfg = self.system_config.persistent_memory
+            if mem_cfg.enabled:
+                self.memory_manager = PersistentMemoryManager(
+                    conf_uid=self.character_config.conf_uid,
+                    max_facts=mem_cfg.max_facts,
+                    diary_count=mem_cfg.diary_count,
+                    recent_sessions=mem_cfg.recent_sessions,
+                )
+                if hasattr(self.agent_engine, "set_memory_manager"):
+                    self.agent_engine.set_memory_manager(self.memory_manager)
+                logger.info("[memory] Persistent memory manager initialised.")
+            else:
+                self.memory_manager = None
 
         except Exception as e:
             logger.error(f"Failed to initialize agent: {e}")
