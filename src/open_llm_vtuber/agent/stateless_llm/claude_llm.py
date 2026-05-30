@@ -6,10 +6,32 @@ for language generation.
 import json
 from typing import AsyncIterator, List, Dict, Any, Union
 
+import anthropic
+import httpx
 from loguru import logger
 from anthropic import AsyncAnthropic, NOT_GIVEN
 
 from .stateless_llm_interface import StatelessLLMInterface
+
+
+def _sniff_image_media_type(base64_data: str, declared: str) -> str:
+    """Return the actual media type by inspecting base64 magic bytes.
+
+    Anthropic strictly validates the declared media_type against image bytes
+    and rejects mismatches with HTTP 400. Discord (and browser paste of
+    screenshots) sometimes mislabel PNG as JPEG, so we override the declared
+    type when the magic bytes contradict it.
+    """
+    sample = base64_data[:24]
+    if sample.startswith("iVBORw0KGgo"):
+        return "image/png"
+    if sample.startswith("/9j/"):
+        return "image/jpeg"
+    if sample.startswith("R0lGOD"):
+        return "image/gif"
+    if sample.startswith("UklGR") and "V0VCUF" in base64_data[:64]:
+        return "image/webp"
+    return declared
 
 
 class AsyncLLM(StatelessLLMInterface):
@@ -19,6 +41,8 @@ class AsyncLLM(StatelessLLMInterface):
         base_url: str = None,
         llm_api_key: str = None,
         system: str = None,
+        enable_web_search: bool = False,
+        max_web_searches: int = 3,
     ):
         """
         Initialize Claude LLM.
@@ -28,17 +52,35 @@ class AsyncLLM(StatelessLLMInterface):
             base_url (str): Base URL for Claude API
             llm_api_key (str): Claude API key
             system (str): System prompt
+            enable_web_search (bool): Declare Anthropic's native web_search
+                server tool so Claude can search the web on its own decision.
+            max_web_searches (int): Cap on searches per reply when enabled.
         """
         self.model = model
         self.system = system
+        self._enable_web_search = enable_web_search
+        self._max_web_searches = max_web_searches
+        if enable_web_search:
+            logger.info(
+                f"Claude native web search enabled (max {max_web_searches}/reply)."
+            )
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
         # request 1-hour prompt cache TTL on cache_control blocks; without it
         # only the default 5-minute TTL is accepted.
+        #
+        # timeout/max_retries harden the connection against flaky networks:
+        # the SDK retries connection failures and retryable statuses (429/5xx,
+        # incl. 529 overload) BEFORE the stream starts consuming. A generous
+        # read timeout accommodates long time-to-first-token on large cached
+        # contexts. (Mid-stream disconnects can't be retried — they'd
+        # duplicate already-streamed text — so the partial reply is kept.)
         self.client = AsyncAnthropic(
             api_key=llm_api_key,
             base_url=base_url if base_url else None,
             default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"},
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            max_retries=4,
         )
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
@@ -57,7 +99,17 @@ class AsyncLLM(StatelessLLMInterface):
                     # Split 'data:image/jpeg;base64,/9j/4AAQ...' into parts
                     header, base64_data = data_url.split(",", 1)
                     # Extract media type from 'data:image/jpeg;base64'
-                    media_type = header.split(":")[1].split(";")[0]
+                    declared_media_type = header.split(":")[1].split(";")[0]
+                    # Discord (and pasted screenshots) sometimes mislabel PNG
+                    # as JPEG; Anthropic rejects mismatches, so we sniff the
+                    # actual bytes and correct the declaration here.
+                    media_type = _sniff_image_media_type(
+                        base64_data, declared_media_type
+                    )
+                    if media_type != declared_media_type:
+                        logger.debug(
+                            f"Image media type corrected: {declared_media_type} → {media_type}"
+                        )
 
                     new_content.append(
                         {
@@ -90,6 +142,7 @@ class AsyncLLM(StatelessLLMInterface):
         messages: List[Dict[str, Any]],
         system: Union[str, List[Dict[str, Any]]] = None,
         tools: List[Dict[str, Any]] = None,
+        max_tokens: int = 1024,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a chat completion using the Claude API asynchronously,
@@ -114,6 +167,7 @@ class AsyncLLM(StatelessLLMInterface):
             - {"type": "message_stop"}
             - {"type": "error", "message": "..."}
         """
+        text_emitted = False
         try:
             # Filter out system messages and convert message format
             converted_messages = [
@@ -122,18 +176,37 @@ class AsyncLLM(StatelessLLMInterface):
                 if msg["role"] != "system"
             ]
 
+            # Build the tool list: caller-supplied tools plus Anthropic's
+            # native web_search server tool when enabled. Web search runs
+            # server-side within this same stream — no client round-trip —
+            # so we just declare it and parse the extra result blocks below.
+            final_tools = list(tools) if tools else []
+            if self._enable_web_search:
+                final_tools.append(
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": self._max_web_searches,
+                    }
+                )
+
             logger.debug(f"Sending messages to Claude API: {converted_messages}")
-            logger.debug(f"Tools provided: {tools}")
+            logger.debug(f"Tools provided: {final_tools}")
 
             async with self.client.messages.stream(
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=1024,
-                tools=tools if tools else NOT_GIVEN,
+                max_tokens=max_tokens,
+                tools=final_tools if final_tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None
                 partial_json_accumulator = ""
+                # Track an in-flight server-side tool call (e.g. web_search)
+                # so its query-JSON deltas don't trip the client-tool path.
+                server_tool_index = None
+                server_tool_name = ""
+                server_tool_query = ""
 
                 async for event in stream:
                     if event.type == "message_start":
@@ -176,11 +249,32 @@ class AsyncLLM(StatelessLLMInterface):
                                 "type": "tool_use_start",
                                 "data": current_tool_call_info.copy(),
                             }
+                        elif event.content_block.type == "server_tool_use":
+                            # Native server-side tool (e.g. web_search).
+                            # Anthropic executes it inline; we only log it.
+                            server_tool_index = event.index
+                            server_tool_name = getattr(
+                                event.content_block, "name", "?"
+                            )
+                            server_tool_query = ""
+                            logger.info(
+                                f"[web_search] model invoked server tool "
+                                f"'{server_tool_name}'"
+                            )
+                        elif event.content_block.type == "web_search_tool_result":
+                            # Search results from Anthropic. Not shown to the
+                            # user; the model folds them into its next text.
+                            result = getattr(event.content_block, "content", None)
+                            count = len(result) if isinstance(result, list) else "?"
+                            logger.info(
+                                f"[web_search] received results ({count} item(s))"
+                            )
                     elif event.type == "content_block_delta":
                         logger.debug(
                             f"Stream: content_block_delta - Index: {event.index}, Delta Type: {event.delta.type}"
                         )
                         if event.delta.type == "text_delta":
+                            text_emitted = True
                             yield {"type": "text_delta", "text": event.delta.text}
                         elif event.delta.type == "input_json_delta":
                             if (
@@ -191,6 +285,12 @@ class AsyncLLM(StatelessLLMInterface):
                                 logger.trace(
                                     f"Stream: input_json_delta - Tool ID: {current_tool_call_info['id']}, Partial: {event.delta.partial_json}"
                                 )
+                            elif (
+                                server_tool_index is not None
+                                and event.index == server_tool_index
+                            ):
+                                # Accumulate the server tool's query JSON for logging.
+                                server_tool_query += event.delta.partial_json
                             else:
                                 logger.warning(
                                     f"Received input_json_delta but no active tool call matching index {event.index}"
@@ -199,6 +299,33 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: content_block_stop - Index: {event.index}"
                         )
+                        # Server-side tool query finished — log what was searched.
+                        if (
+                            server_tool_index is not None
+                            and event.index == server_tool_index
+                        ):
+                            query_str = ""
+                            try:
+                                if server_tool_query.strip():
+                                    parsed = json.loads(server_tool_query)
+                                    query_str = str(parsed.get("query", "")).strip()
+                            except json.JSONDecodeError:
+                                query_str = ""
+                            logger.info(
+                                f"[web_search] query: {query_str or '(empty)'}"
+                            )
+                            # Inline marker at the exact position the search was
+                            # triggered, so the reply shows where it looked things
+                            # up. Display-only (see basic_memory_agent handling).
+                            if server_tool_name == "web_search":
+                                shown = query_str[:80] if query_str else "..."
+                                yield {
+                                    "type": "web_search_marker",
+                                    "text": f"\n🔍 *Web検索: {shown}*\n",
+                                }
+                            server_tool_index = None
+                            server_tool_name = ""
+                            server_tool_query = ""
                         # Check if this stop corresponds to the active tool call
                         if (
                             current_tool_call_info
@@ -237,6 +364,17 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: message_delta - Delta: {event.delta.model_dump(exclude_none=True)}, Usage: {event.usage}"
                         )
+                        # Report how many web searches this reply actually used.
+                        server_use = getattr(event.usage, "server_tool_use", None)
+                        if server_use:
+                            n_searches = getattr(
+                                server_use, "web_search_requests", 0
+                            )
+                            if n_searches:
+                                logger.info(
+                                    f"[web_search] this reply used {n_searches} "
+                                    "web search request(s)"
+                                )
                         yield {
                             "type": "message_delta",
                             "data": {
@@ -255,7 +393,23 @@ class AsyncLLM(StatelessLLMInterface):
                     # The outer try/except handles SDK-level errors.
 
         except Exception as e:
-            logger.error(f"Claude API error occurred: {str(e)}")
+            is_transient = isinstance(
+                e, (httpx.TransportError, anthropic.APIConnectionError)
+            ) or type(e).__name__ in {"BrokenResourceError", "ReadError"}
+            if is_transient and text_emitted:
+                # Connection dropped mid-stream after we'd already streamed
+                # part of the reply. Retrying would duplicate text, so finish
+                # gracefully with whatever was delivered instead of raising
+                # (which would surface a bare error and discard the partial).
+                logger.warning(
+                    f"Claude stream dropped mid-reply ({type(e).__name__}: {e}); "
+                    "delivering partial response and ending turn cleanly."
+                )
+                yield {"type": "message_stop"}
+                logger.debug("Chat completion stream processing finished (partial).")
+                return
+
+            logger.error(f"Claude API error occurred: {type(e).__name__}: {e}")
             logger.info(f"Model: {self.model}")
             # Yield an error event before raising
             yield {"type": "error", "message": f"Claude API error: {str(e)}"}

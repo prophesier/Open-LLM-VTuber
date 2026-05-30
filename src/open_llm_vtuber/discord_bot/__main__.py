@@ -50,6 +50,26 @@ async def _main() -> int:
 
     from .bot import DiscordVTuberBot
     from .bridge import OLVBridge
+    from ..pidfile import write_pid
+
+    # File logging so remote /logs slash command has something to tail.
+    log_dir = project_root / "logs"
+    log_dir.mkdir(exist_ok=True)
+    logger.add(
+        str(log_dir / "discord_{time:YYYY-MM-DD}.log"),
+        rotation="10 MB",
+        retention="30 days",
+        level="DEBUG",
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+            "{name}:{function}:{line} | {message}"
+        ),
+        backtrace=True,
+        diagnose=True,
+    )
+
+    # Write PID so restart.bat can find and kill this process.
+    write_pid("discord", root=project_root)
 
     bridge = OLVBridge(server_url)
     bot = DiscordVTuberBot(
@@ -58,6 +78,8 @@ async def _main() -> int:
         channel_ids=discord_cfg.channel_ids,
         respond_to_mentions_only=discord_cfg.respond_to_mentions_only,
         command_prefix=discord_cfg.command_prefix,
+        admin_user_id=discord_cfg.admin_user_id,
+        project_root=project_root,
     )
 
     await bridge.start()

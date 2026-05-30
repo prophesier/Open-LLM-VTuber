@@ -1,0 +1,71 @@
+@echo off
+REM ============================================================================
+REM Auto-restart script triggered by Discord bot /restart command.
+REM
+REM Reads PID files from pids/, kills OLV + Discord bot, pulls the latest
+REM code from the current branch, then re-launches both services in new
+REM Windows Terminal tabs. TTS (which runs out of a separate project) is
+REM intentionally NOT touched.
+REM
+REM EDIT THE LINE BELOW to match your conda environment name.
+REM ============================================================================
+
+setlocal enabledelayedexpansion
+cd /d "%~dp0"
+
+REM === EDIT THESE ===
+set "CONDA_ENV=openllmvtuber"
+REM Branch to pull from. Leave empty to use the current branch's upstream
+REM (i.e. plain `git pull`). Set to a specific branch name if your local
+REM working branch (e.g. master) is different from the dev branch you want
+REM to track. The pull becomes `git pull origin <branch>` in that case.
+set "GIT_BRANCH="
+REM ==================
+
+REM Strip trailing backslash from %~dp0 so quoting the path for `wt -d`
+REM doesn't accidentally escape the closing quote (which breaks arg parsing).
+set "PROJECT_DIR=%~dp0"
+if "%PROJECT_DIR:~-1%"=="\" set "PROJECT_DIR=%PROJECT_DIR:~0,-1%"
+
+echo Waiting for services to exit cleanly...
+timeout /t 3 /nobreak >nul
+
+if exist pids\olv.pid (
+    set /p OLV_PID=<pids\olv.pid
+    if defined OLV_PID (
+        echo Killing OLV PID !OLV_PID!...
+        taskkill /F /PID !OLV_PID! 2>nul
+    )
+    del /f /q pids\olv.pid 2>nul
+)
+
+if exist pids\discord.pid (
+    set /p BOT_PID=<pids\discord.pid
+    if defined BOT_PID (
+        echo Killing Discord bot PID !BOT_PID!...
+        taskkill /F /PID !BOT_PID! 2>nul
+    )
+    del /f /q pids\discord.pid 2>nul
+)
+
+set "PULL_ARGS="
+if defined GIT_BRANCH set "PULL_ARGS=origin %GIT_BRANCH%"
+
+echo Pulling latest code...
+REM -c core.editor=true ensures git never blocks waiting for a merge commit
+REM message (replaces VS Code / Vim with a no-op).
+REM --no-edit takes the default merge commit message silently if a merge happens.
+git -c core.editor=true pull --no-edit %PULL_ARGS%
+if errorlevel 1 (
+    echo.
+    echo *** Git pull failed. Aborting any in-progress merge. ***
+    git merge --abort 2>nul
+    echo *** Restarting services with the existing code anyway. ***
+    echo.
+)
+
+echo Re-launching OLV and Discord bot in new wt tabs...
+wt new-tab --title OLV -d "%PROJECT_DIR%" cmd /k "call conda activate %CONDA_ENV% && python run_server.py" ; new-tab --title Discord -d "%PROJECT_DIR%" cmd /k "timeout /t 5 && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py"
+
+endlocal
+exit /b 0
