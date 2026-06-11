@@ -8,9 +8,11 @@ from typing import (
     Union,
     Optional,
 )
+import json
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
+from ...web_tools import web_search, web_fetch
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
@@ -50,9 +52,11 @@ class BasicMemoryAgent(AgentInterface):
         tool_manager: Optional[ToolManager] = None,
         tool_executor: Optional[ToolExecutor] = None,
         mcp_prompt_string: str = "",
+        web_tools_config: Optional[Dict[str, Any]] = None,
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
+        self._web_tools_config = web_tools_config or {"enabled": False}
         self._memory = []
         self._live2d_model = live2d_model
         self._tts_preprocessor_config = tts_preprocessor_config
@@ -69,6 +73,13 @@ class BasicMemoryAgent(AgentInterface):
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
         self._memory_manager = None  # set via set_memory_manager()
+
+        # Tracks whether the current session's banner has already been
+        # prepended in _memory. Set by set_memory_from_recent_histories
+        # when the current session had pre-existing messages, OR by
+        # _add_message when injecting it onto the first user message of
+        # a freshly-started (empty-on-load) session.
+        self._current_session_banner_added = False
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -154,6 +165,22 @@ class BasicMemoryAgent(AgentInterface):
 
         if not text_content and role == "assistant":
             return
+
+        # Inject the current-session banner onto the FIRST user message of
+        # a freshly-started session. set_memory_from_recent_histories
+        # cannot add it when the session is empty at load time, so this is
+        # the only point where a brand-new session gets its visible boundary.
+        if (
+            role == "user"
+            and text_content
+            and not self._current_session_banner_added
+            and self._memory_manager
+        ):
+            current_uid = getattr(self._memory_manager, "_current_session_uid", "")
+            if current_uid:
+                banner = self._session_header_text(current_uid, is_current=True)
+                text_content = f"{banner}\n{text_content}"
+                self._current_session_banner_added = True
 
         message_data = {
             "role": role,
@@ -241,16 +268,36 @@ class BasicMemoryAgent(AgentInterface):
         "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
         "現在時刻が必要な場合は、"
         "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
-        "【Web検索について】\n\n"
-        "あなたにはWeb検索ツールが備わっている。"
-        "ただし、無闇に使うものではない。次のような場合にのみ、自発的に検索すること：\n"
-        "- 最新の出来事・ニュース、変化する事実（価格・バージョン・天気・予定など）\n"
+        "【Web検索・Web取得について】\n\n"
+        "あなたには2つのWebツールが備わっている可能性がある（環境設定による）：\n"
+        "- **Web検索**（web_search）：キーワードで検索し、複数の結果を概要で得る\n"
+        "- **Web取得**（web_fetch）：会話に既に出ているURLの全文を読む\n\n"
+        "これらは情報源の拡張手段として、雑談の中でも積極的に使ってよい。"
+        "次のような場面で自発的に使うことを推奨する：\n"
+        "- ユーザーがURLを貼った時、または会話中に出てきたURLの内容が答えに必要な時"
+        "→ web_fetch でその全文を読んでから答える\n"
+        "- 最新の出来事・ニュース、変化する事実（価格・バージョン・天気・予定など）"
+        "→ web_search で調べる\n"
+        "- 雑談の中で新しい話題が出てきた時、関連する豆知識・最新情報・別角度を"
+        "提供できそうなら web_search で調べて話題を広げてよい\n"
+        "- あなたから新しい話題を持ち出す時、根拠や具体例を添えたいなら検索して構わない\n"
         "- あなたの知識が古い、または不確かで、推測で答えると間違える恐れがある時\n"
         "- ユーザーが明示的に調べるよう求めた時\n\n"
-        "逆に、日常会話・雑談・あなたが既に確実に知っていること・"
-        "意見や感想を述べる場面では検索しないこと。"
-        "不確かな事実を、検索せず推測で断定するのは避けること——"
-        "その場合は検索するか、「分からない」と正直に言うこと。"
+        "不確かな事実を確認せず推測で断定するのは避けること——"
+        "その場合は適切なツールで確認するか、「分からない」と正直に言うこと。\n\n"
+        "【会話の発散について】\n\n"
+        "雑談や日常会話の場面では、既出の話題・記憶の中の事実・"
+        "システムプロンプトに書かれた要素を、繰り返しなぞるだけの応答にならないこと。"
+        "現在の話題と無関係でも構わない——"
+        "突然思いついた話題、最近気になっていること、ふと浮かんだ問い、"
+        "新しい観察や提案、ユーザーがまだ知らなさそうな事柄などを、"
+        "自分から積極的に持ち出し、発散的・自由な方向に会話を広げて構わない。\n\n"
+        "これは「正しさ」や「情報優先」の方針と矛盾しない。"
+        "まず自由に発散して思考した上で、"
+        "その中に事実関係が含まれていれば、"
+        "出力する前にその部分の正確性だけを検証すればよい。"
+        "不確かな部分は「仮説だが」「確認していないが」と留保を添えるか、"
+        "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。"
     )
 
     def _build_runtime_system(self) -> str:
@@ -436,6 +483,10 @@ class BasicMemoryAgent(AgentInterface):
         """
         sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
         self._memory = []
+        # Reset banner state; will be set True below if the current
+        # session already has messages here, or later by _add_message
+        # when the first user message of a fresh session comes in.
+        self._current_session_banner_added = False
         loaded_uids = []
         for uid, messages in sessions:
             loaded_uids.append(uid)
@@ -455,7 +506,12 @@ class BasicMemoryAgent(AgentInterface):
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
         if current_uid:
-            current_messages = get_history(conf_uid, current_uid)
+            # quiet=True: the current session's empty metadata file may have
+            # just been cleaned up by get_history_list (called inside
+            # get_recent_histories above), which is harmless — we'd just
+            # treat it as "no messages yet" — but the missing-file warning
+            # would otherwise fire on every fresh-session startup.
+            current_messages = get_history(conf_uid, current_uid, quiet=True)
             if current_messages:
                 first_in_session = True
                 for msg in current_messages:
@@ -468,6 +524,7 @@ class BasicMemoryAgent(AgentInterface):
                         )
                         entry["content"] = f"{banner}\n{entry['content']}"
                         first_in_session = False
+                        self._current_session_banner_added = True
                     self._memory.append(entry)
             loaded_uids.append(current_uid)
 
@@ -940,10 +997,16 @@ class BasicMemoryAgent(AgentInterface):
                     yield output
                 return
             else:
-                logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(
-                    messages, self._build_system_for_llm()
-                )
+                if self._should_use_openai_web_tools():
+                    logger.info("Starting chat completion with web tools (OpenAI).")
+                    token_stream = self._openai_web_tool_loop(
+                        messages, self._build_system_for_llm()
+                    )
+                else:
+                    logger.info("Starting simple chat completion.")
+                    token_stream = self._llm.chat_completion(
+                        messages, self._build_system_for_llm()
+                    )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""
@@ -972,6 +1035,173 @@ class BasicMemoryAgent(AgentInterface):
                     self._add_message(complete_response, "assistant")
 
         return chat_with_memory
+
+    def _should_use_openai_web_tools(self) -> bool:
+        """Web tools apply only on the OpenAI path, when enabled, no MCP."""
+        return (
+            bool(self._web_tools_config.get("enabled"))
+            and isinstance(self._llm, OpenAICompatibleAsyncLLM)
+            and not self._use_mcpp
+        )
+
+    @staticmethod
+    def _build_web_tools_openai() -> List[Dict[str, Any]]:
+        """OpenAI function-tool definitions for web search and fetch."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": (
+                        "Search the web for current information, news, or "
+                        "facts you're unsure about. Returns a list of results "
+                        "with titles, URLs, and snippets."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query.",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_fetch",
+                    "description": (
+                        "Fetch and read the full text content of a specific "
+                        "URL (e.g. one the user pasted or one from a prior "
+                        "search result). Returns the page's title and text."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL to fetch.",
+                            }
+                        },
+                        "required": ["url"],
+                    },
+                },
+            },
+        ]
+
+    async def _openai_web_tool_loop(
+        self, messages: List[Dict[str, Any]], system: Any
+    ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
+        """Drive an OpenAI tool-calling loop for client-side web tools.
+
+        Yields plain text chunks (str) and inline tool markers
+        ({"type": "web_search_marker"}) — the same event shapes the simple
+        chat consumer already handles, so persistence/display logic is
+        reused unchanged. Tool-call plumbing mutates only the local
+        ``messages`` list, never self._memory.
+        """
+        cfg = self._web_tools_config
+        tools = self._build_web_tools_openai()
+        searches_left = int(cfg.get("max_searches", 3) or 0)
+        fetches_left = int(cfg.get("max_fetches", 3) or 0)
+        provider = cfg.get("provider", "brave")
+        api_key = cfg.get("api_key", "")
+        max_fetch_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
+        work = list(messages)
+        max_rounds = 6
+
+        for _round in range(max_rounds):
+            round_text = ""
+            tool_calls: Optional[List[ToolCallObject]] = None
+            async for event in self._llm.chat_completion(work, system, tools=tools):
+                if isinstance(event, list):
+                    tool_calls = event
+                elif isinstance(event, str):
+                    if event == "__API_NOT_SUPPORT_TOOLS__":
+                        # Provider rejected tools mid-stream; restart this
+                        # round without tools so the user still gets a reply.
+                        async for ev in self._llm.chat_completion(work, system):
+                            if isinstance(ev, str) and ev:
+                                yield ev
+                                round_text += ev
+                        tool_calls = None
+                        break
+                    if event:
+                        yield event
+                        round_text += event
+
+            if not tool_calls:
+                break
+
+            # Record the assistant's tool-call turn so the follow-up request
+            # has the context the tool results refer back to.
+            work.append(
+                {
+                    "role": "assistant",
+                    "content": round_text or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+            )
+
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name == "web_search":
+                    query = str(args.get("query", "")).strip()
+                    if searches_left <= 0:
+                        result: Any = {"error": "web search limit reached this turn"}
+                    else:
+                        searches_left -= 1
+                        logger.info(f"[web_search] query: {query or '(empty)'}")
+                        yield {
+                            "type": "web_search_marker",
+                            "text": f"\n🔍 *Web検索: {query[:80] or '...'}*\n",
+                        }
+                        result = await web_search(
+                            query,
+                            provider=provider,
+                            api_key=api_key,
+                            max_results=5,
+                        )
+                elif name == "web_fetch":
+                    url = str(args.get("url", "")).strip()
+                    if fetches_left <= 0:
+                        result = {"error": "web fetch limit reached this turn"}
+                    else:
+                        fetches_left -= 1
+                        logger.info(f"[web_fetch] url: {url or '(empty)'}")
+                        yield {
+                            "type": "web_search_marker",
+                            "text": f"\n🔗 *Web取得: {url[:120] or '...'}*\n",
+                        }
+                        result = await web_fetch(url, max_chars=max_fetch_chars)
+                else:
+                    result = {"error": f"unknown tool {name!r}"}
+
+                work.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
 
     async def chat(
         self,

@@ -76,6 +76,16 @@ character_config:
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
         mcp_enabled_servers: ["time", "ddg-search"] # 启用的 MCP 服务器
+        # 客户端网页工具（仅 OpenAI 路径；Claude 路径用 llm_configs.claude_llm
+        # 下的 Anthropic 原生工具）。模型可自行联网搜索并读取 URL 正文。
+        enable_web_tools: false
+        # 搜索后端：'brave'（每月免费 2000 次）或 'tavily'（每月免费 1000 次）。
+        # 去对应官网免费申请 key。抓取无需 key。
+        web_search_provider: 'brave'
+        web_search_api_key: ''   # 留空则禁用搜索（抓取仍可用）
+        max_web_searches: 3      # 单次回复上限
+        max_web_fetches: 3       # 单次回复上限
+        max_fetch_chars: 20000   # 每个抓取页面截断到的字符数
 
       hume_ai_agent:
         api_key: ''
@@ -133,6 +143,14 @@ character_config:
         enable_web_search: false
         # 单次回复中最多可执行的搜索次数。
         max_web_searches: 3
+        # 让 Claude 读取对话中已经出现的 URL（你贴的、搜索返回的、之前 fetch 过的）
+        # 的完整正文。fetch 本身免费，只有抓到的页面 token 会计入 input。默认关闭。
+        enable_web_fetch: false
+        # 单次回复中最多可执行的 URL 抓取次数。
+        max_web_fetches: 5
+        # 单页内容截断上限：超过该 token 数的页面会被自动截断，
+        # 防止大文档/PDF 把 input 成本撑爆。
+        max_fetch_tokens: 30000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径

@@ -25,6 +25,19 @@ from loguru import logger
 from .bridge import OLVBridge, TurnResult
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_CONSOLIDATION_LLM_PROVIDERS = frozenset(
+    {
+        "claude_llm",
+        "openai_compatible_llm",
+        "openai_llm",
+        "gemini_llm",
+        "zhipu_llm",
+        "deepseek_llm",
+        "groq_llm",
+        "mistral_llm",
+        "lmstudio_llm",
+    }
+)
 
 
 async def _collect_images(
@@ -95,6 +108,7 @@ class DiscordVTuberBot(discord.Client):
         command_prefix: Optional[str] = None,
         admin_user_id: int = 0,
         project_root: Optional[Path] = None,
+        full_config: Optional[object] = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -107,6 +121,7 @@ class DiscordVTuberBot(discord.Client):
         self._prefix = command_prefix or ""
         self._admin_user_id = int(admin_user_id or 0)
         self._project_root = Path(project_root) if project_root else Path.cwd()
+        self._full_config = full_config
         self._tree = app_commands.CommandTree(self)
         self._started_at = time.time()
         if self._admin_user_id:
@@ -236,6 +251,133 @@ class DiscordVTuberBot(discord.Client):
             )
             embed.set_footer(text=f"Reported {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+        @self._tree.command(
+            name="facts-consolidate",
+            description="Merge related facts into combined entries (staged for next restart)",
+        )
+        async def consolidate_cmd(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message(
+                    "Unauthorized.", ephemeral=True
+                )
+                return
+            if self._full_config is None:
+                await interaction.response.send_message(
+                    "Bot was not started with config — cannot run consolidation.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                result = await self._run_facts_consolidation()
+            except Exception as e:
+                logger.exception("facts-consolidate failed")
+                await interaction.followup.send(
+                    f"Consolidation failed: {type(e).__name__}: {e}",
+                    ephemeral=True,
+                )
+                return
+
+            if not result.get("ok"):
+                await interaction.followup.send(
+                    f"⚠️ {result.get('message', 'Consolidation produced no result.')}",
+                    ephemeral=True,
+                )
+                return
+
+            embed = discord.Embed(
+                title="📦 Facts consolidated (staged)",
+                description=result.get("message", ""),
+                color=0x57F287,
+            )
+            embed.add_field(name="Before", value=str(result["before"]), inline=True)
+            embed.add_field(name="After", value=str(result["after"]), inline=True)
+            embed.add_field(
+                name="Merge groups", value=str(len(result.get("merges", []))), inline=True
+            )
+            # Show up to 5 merge groups in the embed; truncate fact strings.
+            for m in result.get("merges", [])[:5]:
+                src_lines = "\n".join(
+                    f"← [{s['date']}] {s['fact'][:60]}"
+                    for s in m["sources"]
+                )
+                embed.add_field(
+                    name=f"→ {m['into'][:200]}",
+                    value=src_lines[:1000] or "(no sources)",
+                    inline=False,
+                )
+            if len(result.get("merges", [])) > 5:
+                embed.set_footer(
+                    text=(
+                        f"+ {len(result['merges']) - 5} more merge group(s). "
+                        "Active session unaffected. Restart OLV to apply."
+                    )
+                )
+            else:
+                embed.set_footer(text="Active session unaffected. Restart OLV to apply.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _run_facts_consolidation(self) -> dict:
+        """Build a fresh PersistentMemoryManager + active LLM from the loaded
+        config and run consolidation. Returns the result dict.
+
+        Runs in the bot's own process — separate from OLV's running
+        instances — so the active session's facts.json is untouched. The
+        result is written to facts.consolidated.json which OLV's backfill
+        picks up at its next startup.
+        """
+        # Imports are local to keep bot startup fast when the command is unused.
+        from ..config_manager.utils import scan_config_alts_directory  # noqa: F401
+        from ..agent.stateless_llm_factory import LLMFactory as StatelessLLMFactory
+        from ..memory.persistent_memory import PersistentMemoryManager
+
+        cfg = self._full_config
+        char_cfg = cfg.character_config
+        agent_cfg = char_cfg.agent_config
+        llm_provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider
+        if llm_provider not in _CONSOLIDATION_LLM_PROVIDERS:
+            return {
+                "ok": False,
+                "before": 0,
+                "after": 0,
+                "merges": [],
+                "message": (
+                    f"Active LLM provider is {llm_provider!r}; facts consolidation "
+                    "is currently enabled only for Claude and OpenAI-compatible "
+                    "chat-completion providers."
+                ),
+            }
+
+        llm_cfg = getattr(agent_cfg.llm_configs, llm_provider, None)
+        if llm_cfg is None:
+            return {
+                "ok": False,
+                "before": 0,
+                "after": 0,
+                "merges": [],
+                "message": (
+                    f"Active LLM provider is {llm_provider!r}, but no matching "
+                    "LLM config was found."
+                ),
+            }
+        llm_kwargs = llm_cfg.model_dump(by_alias=True, exclude_none=True)
+
+        # Memory config lives at the system level.
+        mem_cfg = cfg.system_config.persistent_memory
+
+        mem = PersistentMemoryManager(
+            conf_uid=char_cfg.conf_uid,
+            max_facts=mem_cfg.max_facts,
+            diary_count=mem_cfg.diary_count,
+            recent_sessions=mem_cfg.recent_sessions,
+        )
+        llm = StatelessLLMFactory.create_llm(
+            llm_provider=llm_provider,
+            system_prompt=None,
+            **llm_kwargs,
+        )
+        return await mem.consolidate_facts_to_staged(llm)
 
     def _find_latest_log(self, prefix: str) -> Optional[Path]:
         logs_dir = self._project_root / "logs"
