@@ -1,0 +1,45 @@
+# Mirrors every push on this branch to a personal (non-fork) repository so
+# the commits count toward the GitHub contribution graph. Because the graph
+# only counts commits on a repo's DEFAULT branch, the working branch is
+# force-pushed to the mirror's `main`.
+#
+# One-time setup (in THIS fork's Settings → Secrets and variables → Actions):
+#   1. Create the destination repo on GitHub (New repository, NOT a fork).
+#   2. Create a Personal Access Token with contents:write on that repo, and
+#      add it here as a SECRET named  MIRROR_TOKEN.
+#   3. Add a VARIABLE named  MIRROR_REPO  set to  owner/repo-name
+#      (e.g. prophesier/Open-LLM-VTuber-hiro).
+#   4. Make sure Actions are enabled on this fork (Actions tab → enable).
+#
+# After that, nothing manual is needed — each push auto-mirrors.
+name: Mirror to personal repo
+
+on:
+  push:
+    branches:
+      - claude/discord-bridge-WTKyJ
+      - main
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Skip cleanly if the mirror target isn't configured yet.
+    if: ${{ vars.MIRROR_REPO != '' }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so past commit dates backfill the graph
+
+      - name: Force-push current HEAD to mirror's main
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          MIRROR_REPO: ${{ vars.MIRROR_REPO }}
+        run: |
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "MIRROR_TOKEN secret is not set; skipping mirror." >&2
+            exit 0
+          fi
+          git push --force \
+            "https://x-access-token:${MIRROR_TOKEN}@github.com/${MIRROR_REPO}.git" \
+            "HEAD:main"
